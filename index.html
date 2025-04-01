@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interstellar Black Hole Visualizer V2</title>
+    <style>
+        /* CSS remains largely the same */
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+        #visualizerCanvas { display: block; position: fixed; top: 0; left: 0; z-index: -1; cursor: grab; } /* Add cursor style */
+        #visualizerCanvas:active { cursor: grabbing; } /* Cursor style when dragging */
+        #uiOverlay { position: fixed; bottom: 15px; left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.7); padding: 15px; border-radius: 10px; display: flex; flex-direction: column; align-items: center; gap: 12px; z-index: 10; max-width: 90%; box-sizing: border-box; }
+        .control-row { display: flex; align-items: center; gap: 15px; width: 100%; flex-wrap: wrap; justify-content: center; }
+        #uiOverlay button { background-color: #555; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 0.9em; transition: background-color 0.2s ease; flex-shrink: 0; }
+        #uiOverlay button:hover { background-color: #777; }
+        #uiOverlay input[type="file"] { color: white; font-size: 0.9em; max-width: 180px; }
+        #uiOverlay input[type="file"]::file-selector-button { background-color: #555; color: white; border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; margin-right: 10px; transition: background-color 0.2s ease; font-size: 0.9em; }
+        #uiOverlay input[type="file"]::file-selector-button:hover { background-color: #777; }
+        #seekBar { flex-grow: 1; min-width: 150px; cursor: pointer; height: 8px; background: #444; border-radius: 4px; outline: none; -webkit-appearance: none; appearance: none; }
+        #seekBar::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: #ddd; border-radius: 50%; cursor: pointer; }
+        #seekBar::-moz-range-thumb { width: 16px; height: 16px; background: #ddd; border-radius: 50%; cursor: pointer; border: none; }
+        #volumeControl { cursor: pointer; height: 6px; background: #444; border-radius: 3px; outline: none; -webkit-appearance: none; appearance: none; width: 100px; }
+        #volumeControl::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; background: #bbb; border-radius: 50%; cursor: pointer; }
+        #volumeControl::-moz-range-thumb { width: 14px; height: 14px; background: #bbb; border-radius: 50%; cursor: pointer; border: none; }
+        #timeDisplay { font-size: 0.9em; min-width: 85px; text-align: right; flex-shrink: 0; }
+        label { font-size: 0.9em; margin-right: 5px; flex-shrink: 0; }
+        #youtubeLinkInput { flex-grow: 1; min-width: 150px; padding: 5px 8px; border: 1px solid #555; background-color: #333; color: white; border-radius: 4px; font-size: 0.9em; }
+        .info-text { font-size: 0.8em; color: #aaa; margin-top: 5px; text-align: center; width: 100%; }
+    </style>
+</head>
+<body>
+    <canvas id="visualizerCanvas"></canvas>
+
+    <div id="uiOverlay">
+         <div class="control-row">
+             <input type="file" id="audioFile" accept="audio/*">
+             <span>OR</span>
+             <input type="text" id="youtubeLinkInput" placeholder="Paste YouTube link (won't play)">
+             <button id="loadYoutubeBtn">Info</button>
+         </div>
+         <div class="control-row">
+            <button id="playPauseBtn">Play</button>
+            <input type="range" id="seekBar" value="0" step="0.1" min="0" max="100">
+            <span id="timeDisplay">0:00 / 0:00</span>
+            <label for="volumeControl">Vol:</label>
+            <input type="range" id="volumeControl" min="0" max="1" step="0.01" value="1">
+         </div>
+         <div class="info-text">
+             *Right-click & Drag to rotate view. Scroll to Zoom.
+         </div>
+         <div class="info-text">
+             *Direct YouTube playback not supported. Please upload audio file.
+         </div>
+    </div>
+
+    <audio id="audioPlayer" style="display: none;"></audio>
+
+    <!-- Import Three.js, Postprocessing & Controls -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js'; // Import OrbitControls
+
+        // --- Global Variables ---
+        let scene, camera, renderer, composer, bloomPass, controls; // Added controls
+        let galaxyParticles, galaxyGeometry, galaxyMaterial;
+        let audioContext, analyser, sourceNode, frequencyData;
+        let isPlaying = false;
+        let baseParticleSize = 0.06;
+        const particleCount = 12000;
+        const galaxyRadius = 80;
+
+        // Black Hole & Disk
+        let blackHoleMesh, accretionDiskMesh, accretionDiskLensedMesh;
+        const blackHoleRadius = 4.0;
+        const diskInnerRadius = blackHoleRadius + 0.5;
+        const diskOuterRadius = blackHoleRadius * 3.5;
+        const diskThickness = 0.4;
+        const diskColorHot = new THREE.Color(0xffcc00); // Target color for heating planets
+        const diskColorWarm = new THREE.Color(0xff8800); // Intermediate color
+
+        // Planets & Consumption
+        let planets = [];
+        const numPlanets = 12;
+        const planetMinRadius = 0.6;
+        const planetMaxRadius = 2.0;
+        const planetSpawnRadius = galaxyRadius * 1.1;
+        const planetBaseSpeed = 0.015;
+        // New distances for gradual consumption
+        const heatingDistance = diskOuterRadius * 1.1; // Start heating/glowing further out
+        const plasmaDistance = diskOuterRadius * 0.7; // Start significant shrinking / color shift
+        const consumptionDistance = blackHoleRadius + 0.5; // Final disappearance distance
+
+        let directionalLight;
+        const clock = new THREE.Clock();
+
+        // --- DOM Elements ---
+        const canvas = document.getElementById('visualizerCanvas');
+        const audioPlayer = document.getElementById('audioPlayer');
+        // ... (other DOM elements remain the same) ...
+        const fileInput = document.getElementById('audioFile');
+        const playPauseBtn = document.getElementById('playPauseBtn');
+        const seekBar = document.getElementById('seekBar');
+        const timeDisplay = document.getElementById('timeDisplay');
+        const volumeControl = document.getElementById('volumeControl');
+        const youtubeLinkInput = document.getElementById('youtubeLinkInput');
+        const loadYoutubeBtn = document.getElementById('loadYoutubeBtn');
+
+        // --- Initialization ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.007);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1500);
+            camera.position.set(0, 25, 70);
+
+            renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ReinhardToneMapping;
+            renderer.toneMappingExposure = 1.2;
+
+            // --- Orbit Controls ---
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enablePan = false; // Disable panning
+            controls.enableZoom = true; // Enable scroll zoom
+            controls.enableRotate = true; // Enable rotation
+            controls.mouseButtons = { // Configure mouse buttons
+                 LEFT: null, // No action on left click
+                 MIDDLE: null, // No action on middle click
+                 RIGHT: THREE.MOUSE.ROTATE // Rotate with right mouse button
+            };
+            controls.zoomSpeed = 0.8;
+            controls.rotateSpeed = 0.5;
+            controls.minDistance = 15; // Min zoom distance
+            controls.maxDistance = 350; // Max zoom distance
+            controls.target.set(0, 0, 0); // Orbit around the center (black hole)
+            controls.update(); // Initial update
+
+            // --- Black Hole Core --- (Same as before)
+            const blackHoleGeometry = new THREE.SphereGeometry(blackHoleRadius, 32, 32);
+            const blackHoleMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, // Ensure it's pure black
+                                                                   opacity: 1.0,
+                                                                   transparent: false});
+            blackHoleMesh = new THREE.Mesh(blackHoleGeometry, blackHoleMaterial);
+            scene.add(blackHoleMesh);
+
+
+            // --- Accretion Disk --- (Same as before)
+            const diskTexture = createAccretionDiskTexture(512);
+            const diskMaterial = new THREE.MeshBasicMaterial({
+                map: diskTexture, side: THREE.DoubleSide, transparent: true,
+                blending: THREE.AdditiveBlending, depthWrite: false, fog: false
+            });
+            const diskGeometry = new THREE.TorusGeometry((diskInnerRadius + diskOuterRadius) / 2, (diskOuterRadius - diskInnerRadius) / 2, 16, 64);
+            accretionDiskMesh = new THREE.Mesh(diskGeometry, diskMaterial);
+            accretionDiskMesh.rotation.x = Math.PI / 2;
+            scene.add(accretionDiskMesh);
+            const diskLensedGeometry = new THREE.TorusGeometry((diskInnerRadius + diskOuterRadius) / 2, (diskOuterRadius - diskInnerRadius) / 2, 16, 64);
+            accretionDiskLensedMesh = new THREE.Mesh(diskLensedGeometry, diskMaterial);
+            scene.add(accretionDiskLensedMesh);
+
+
+            // --- Galaxy Particles (Stars) --- (Same as before)
+            galaxyGeometry = new THREE.BufferGeometry();
+            // ... (position/color generation same) ...
+             const positions = new Float32Array(particleCount * 3);
+             const colors = new Float32Array(particleCount * 3);
+             const initialColor = new THREE.Color(0xffffff);
+             for (let i = 0; i < particleCount; i++) {
+                 const radius = diskOuterRadius * 1.5 + Math.random() * galaxyRadius;
+                 const theta = Math.random() * Math.PI * 2;
+                 const phi = (Math.random() - 0.5) * Math.PI * 0.4;
+                 const x = radius * Math.cos(phi) * Math.cos(theta);
+                 const y = radius * Math.sin(phi);
+                 const z = radius * Math.cos(phi) * Math.sin(theta);
+                 positions[i * 3] = x; positions[i * 3 + 1] = y; positions[i * 3 + 2] = z;
+                 colors[i * 3] = initialColor.r; colors[i * 3 + 1] = initialColor.g; colors[i * 3 + 2] = initialColor.b;
+             }
+            galaxyGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            galaxyGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            galaxyMaterial = new THREE.PointsMaterial({
+                size: baseParticleSize, vertexColors: true, sizeAttenuation: true,
+                transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false
+            });
+            galaxyParticles = new THREE.Points(galaxyGeometry, galaxyMaterial);
+            scene.add(galaxyParticles);
+
+            // --- Lighting --- (Same as before)
+            directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
+            directionalLight.position.set(10, 20, 15);
+            scene.add(directionalLight);
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.3);
+            scene.add(ambientLight);
+
+
+            // --- Planets ---
+            for (let i = 0; i < numPlanets; i++) {
+                createPlanet();
+            }
+
+            // --- Post-processing (Bloom) --- (Same as before)
+            const renderScene = new RenderPass(scene, camera);
+            bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight), 1.2, 0.2, 0.3
+            );
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            window.addEventListener('resize', onWindowResize, false);
+            volumeControl.value = audioPlayer.volume;
+            animate();
+        }
+
+        // --- Accretion Disk Texture Generation --- (Same as before)
+        function createAccretionDiskTexture(size) {
+            const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d'); const center = size / 2; const maxRadius = size / 2;
+            ctx.fillStyle = 'rgba(0,0,0,0)'; ctx.fillRect(0, 0, size, size);
+            const gradient = ctx.createRadialGradient(center, center, 0, center, center, maxRadius);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)'); gradient.addColorStop(0.1, 'rgba(255, 255, 200, 1)');
+            gradient.addColorStop(0.3, 'rgba(255, 200, 0, 1)'); gradient.addColorStop(0.6, 'rgba(255, 100, 0, 0.9)');
+            gradient.addColorStop(1, 'rgba(150, 0, 0, 0.5)'); ctx.fillStyle = gradient; ctx.fillRect(0, 0, size, size);
+            ctx.globalCompositeOperation = 'overlay';
+            for (let i = 0; i < size * 2; i++) {
+                 ctx.beginPath(); const angle = Math.random() * Math.PI * 2; const startRadius = Math.random() * maxRadius * 0.5;
+                 const endRadius = startRadius + Math.random() * maxRadius * 0.8; const intensity = Math.random() * 0.3 + 0.1;
+                 ctx.strokeStyle = `rgba(255, 255, 255, ${intensity})`; ctx.lineWidth = Math.random() * 2 + 0.5;
+                 ctx.arc(center, center, (startRadius + endRadius) / 2, angle, angle + Math.PI * (Math.random() * 0.2 + 0.1)); ctx.stroke();
+            }
+            ctx.globalCompositeOperation = 'source-over';
+            const texture = new THREE.CanvasTexture(canvas); texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
+            texture.needsUpdate = true; return texture;
+        }
+
+
+        // --- Planet Creation & Management ---
+        function createPlanet() {
+            const planetRadius = THREE.MathUtils.randFloat(planetMinRadius, planetMaxRadius);
+            const planetGeometry = new THREE.SphereGeometry(planetRadius, 16, 12);
+            // Use MeshStandardMaterial initially
+            const planetMaterial = new THREE.MeshStandardMaterial({
+                color: new THREE.Color(Math.random() * 0xffffff),
+                roughness: 0.7,
+                metalness: 0.3,
+                emissive: 0x000000, // Start with no emission
+                 // We will store the original color
+                 userData: { originalColor: new THREE.Color() }
+            });
+             planetMaterial.userData.originalColor.copy(planetMaterial.color);
+
+            const planetMesh = new THREE.Mesh(planetGeometry, planetMaterial);
+
+            const planet = {
+                mesh: planetMesh,
+                radius: planetRadius,
+                state: 'active', // 'active', 'heating', 'dissipating', 'inactive'
+                respawnTimer: 0,
+                baseScale: THREE.MathUtils.randFloat(0.8, 1.3) // Store base scale
+            };
+
+            resetPlanetPosition(planet);
+            planets.push(planet);
+            scene.add(planet.mesh);
+        }
+
+        function resetPlanetPosition(planet) {
+            const theta = Math.random() * Math.PI * 2;
+            const phi = (Math.random() - 0.5) * Math.PI * 0.3;
+            const r = planetSpawnRadius + Math.random() * 40;
+
+            planet.mesh.position.set(
+                r * Math.cos(phi) * Math.cos(theta),
+                r * Math.sin(phi),
+                r * Math.cos(phi) * Math.sin(theta)
+            );
+
+            // Reset scale and material properties
+             planet.mesh.scale.set(planet.baseScale, planet.baseScale, planet.baseScale);
+             planet.mesh.material.color.copy(planet.mesh.material.userData.originalColor);
+             planet.mesh.material.emissive.setHex(0x000000);
+             planet.mesh.material.needsUpdate = true; // Crucial after changing material props
+             planet.mesh.visible = true;
+            planet.state = 'active';
+            planet.respawnTimer = 0;
+        }
+
+
+        // --- REMOVED Debris System ---
+
+
+        // --- Audio Setup --- (Same as before)
+        function setupAudio() { /* ... same ... */
+            if (!audioContext) { audioContext = new (window.AudioContext || window.webkitAudioContext)(); }
+            if (sourceNode) { try { sourceNode.disconnect(); } catch (e) {} }
+            if (!sourceNode || sourceNode.mediaElement !== audioPlayer) {
+                sourceNode = audioContext.createMediaElementSource(audioPlayer);
+                analyser = audioContext.createAnalyser(); analyser.fftSize = 512;
+                frequencyData = new Uint8Array(analyser.frequencyBinCount);
+                sourceNode.connect(analyser); analyser.connect(audioContext.destination);
+                console.log("AudioContext Initialized. Freq bins:", analyser.frequencyBinCount);
+            } else { try { sourceNode.connect(analyser); analyser.connect(audioContext.destination); } catch(e) {} }
+            audioPlayer.volume = volumeControl.value;
+        }
+
+         // --- Update Visuals based on Audio --- (Same as before)
+         function updateVisuals() { /* ... same galaxy particle updates ... */
+             if (!analyser || !isPlaying || !frequencyData) return;
+             analyser.getByteFrequencyData(frequencyData);
+             const bufferLength = analyser.frequencyBinCount;
+             const bassCutoff = Math.floor(bufferLength * 0.15); const midCutoff = Math.floor(bufferLength * 0.5);
+             let bassAvg = 0, midAvg = 0, trebleAvg = 0; let bassCount = 0, midCount = 0, trebleCount = 0;
+             for (let i = 0; i < bufferLength; i++) {
+                  const v = frequencyData[i]; if (i < bassCutoff) { bassAvg += v; bassCount++; }
+                  else if (i < midCutoff) { midAvg += v; midCount++; } else { trebleAvg += v; trebleCount++; }
+             }
+              bassAvg = bassCount > 0 ? bassAvg / bassCount : 0; midAvg = midCount > 0 ? midAvg / midCount : 0; trebleAvg = trebleCount > 0 ? trebleAvg / trebleCount : 0;
+              const bassNorm = bassAvg / 255; const midNorm = midAvg / 255; const trebleNorm = trebleAvg / 255; const overallIntensity = (bassNorm + midNorm + trebleNorm) / 3;
+             const colors = galaxyGeometry.attributes.color.array; const tempColor = new THREE.Color();
+             for (let i = 0; i < particleCount; i++) {
+                 const r = bassNorm * 0.5 + midNorm * 0.3 + 0.2; const g = midNorm * 0.5 + trebleNorm * 0.3 + 0.1; const b = trebleNorm * 0.6 + bassNorm * 0.2 + 0.3;
+                 tempColor.setRGB(Math.min(1, r), Math.min(1, g), Math.min(1, b));
+                 colors[i * 3] = tempColor.r; colors[i * 3 + 1] = tempColor.g; colors[i * 3 + 2] = tempColor.b;
+             }
+             galaxyGeometry.attributes.color.needsUpdate = true;
+             const pulseStrength = 2.0; galaxyMaterial.size = baseParticleSize * (1 + bassNorm * pulseStrength);
+             const rotationSpeedBoost = overallIntensity;
+             galaxyParticles.rotation.y += (0.00005 + rotationSpeedBoost * 0.0003) * clock.getDelta() * 60;
+             const diskIntensityBoost = bassNorm * 0.5; bloomPass.strength = 1.0 + diskIntensityBoost * 1.5;
+         }
+
+        // --- Update Planets --- (Modified Logic)
+        function updatePlanets(deltaTime) {
+             const center = new THREE.Vector3(0, 0, 0);
+
+             planets.forEach(planet => {
+                 if (planet.state === 'inactive') {
+                     planet.respawnTimer -= deltaTime;
+                     if (planet.respawnTimer <= 0) {
+                         resetPlanetPosition(planet);
+                     }
+                     return;
+                 }
+
+                 const currentPos = planet.mesh.position;
+                 const directionToCenter = center.clone().sub(currentPos);
+                 const distanceToCenter = directionToCenter.length();
+
+                 // Determine state based on distance
+                 let targetState = 'active';
+                 if (distanceToCenter < consumptionDistance) {
+                      targetState = 'inactive'; // Gone
+                 } else if (distanceToCenter < plasmaDistance) {
+                      targetState = 'dissipating';
+                 } else if (distanceToCenter < heatingDistance) {
+                      targetState = 'heating';
+                 }
+                 planet.state = targetState; // Update state directly
+
+
+                 // --- Apply State Effects ---
+
+                 if (planet.state === 'inactive') {
+                      planet.mesh.visible = false;
+                      planet.respawnTimer = Math.random() * 8 + 7; // Longer respawn time maybe?
+                      return;
+                 }
+
+                 // Move planet towards the center (applies to all active states)
+                 const speed = (planetBaseSpeed + (Math.random() * 0.005)) * deltaTime * 60;
+                 directionToCenter.normalize();
+                 planet.mesh.position.add(directionToCenter.multiplyScalar(speed));
+
+                  // Simple rotation
+                  planet.mesh.rotation.y += 0.01 * deltaTime * 60;
+                  planet.mesh.rotation.x += 0.004 * deltaTime * 60;
+
+
+                 // Material & Scale adjustments based on state
+                 const material = planet.mesh.material;
+                 const originalColor = material.userData.originalColor;
+                 let scaleFactor = planet.baseScale;
+
+                 if (planet.state === 'heating') {
+                     // Progress within the heating zone (1 = outer edge, 0 = inner edge)
+                     const heatingProgress = THREE.MathUtils.mapLinear(distanceToCenter, heatingDistance, plasmaDistance, 1, 0);
+                     // Lerp color towards warm disk color
+                     material.color.lerpColors(originalColor, diskColorWarm, heatingProgress);
+                     // Start adding emissive glow
+                     material.emissive.lerpColors(new THREE.Color(0x000000), diskColorWarm, heatingProgress);
+                     material.emissiveIntensity = heatingProgress * 2.0; // Make it glow brighter as it gets closer
+                     // Slight shrink starts
+                     scaleFactor = THREE.MathUtils.lerp(planet.baseScale, planet.baseScale * 0.8, heatingProgress);
+
+                 } else if (planet.state === 'dissipating') {
+                     // Progress within the dissipating zone (1 = outer edge, 0 = consumption edge)
+                     const dissipatingProgress = THREE.MathUtils.mapLinear(distanceToCenter, plasmaDistance, consumptionDistance, 1, 0);
+                      // Lerp color fully towards hot disk color
+                     material.color.lerpColors(diskColorWarm, diskColorHot, dissipatingProgress);
+                     // Make emissive much stronger and hotter color
+                      material.emissive.lerpColors(diskColorWarm, diskColorHot, dissipatingProgress);
+                      material.emissiveIntensity = 2.0 + dissipatingProgress * 4.0; // Intense glow
+                     // Rapidly shrink the planet
+                     scaleFactor = THREE.MathUtils.lerp(planet.baseScale * 0.8, 0.01, dissipatingProgress); // Shrink towards near zero
+
+                 } else { // Active state (outside heating zone)
+                     // Ensure material is reset (might be needed if lerping didn't reach 0)
+                     if (!material.color.equals(originalColor)) material.color.copy(originalColor);
+                     if (material.emissive.getHex() !== 0x000000) material.emissive.setHex(0x000000);
+                     material.emissiveIntensity = 0;
+                      scaleFactor = planet.baseScale;
+                 }
+
+                 planet.mesh.scale.set(scaleFactor, scaleFactor, scaleFactor);
+                 material.needsUpdate = true; // Important! Tell Three.js material changed
+
+             });
+        }
+
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const deltaTime = clock.getDelta();
+
+            // Update OrbitControls
+            controls.update(); // Update controls state (needed for damping, etc.)
+
+            // Rotate accretion disk
+             accretionDiskMesh.rotation.z -= 0.03 * deltaTime;
+             accretionDiskLensedMesh.rotation.z -= 0.03 * deltaTime;
+
+            updateVisuals(); // Update based on audio
+            updatePlanets(deltaTime);
+            // updateDebris removed
+
+            // Constant background rotation if not playing
+            if (!isPlaying) {
+                 galaxyParticles.rotation.y += 0.0001 * deltaTime * 60;
+                 bloomPass.strength = 1.0;
+            }
+
+            composer.render(deltaTime);
+        }
+
+        // --- Event Handlers --- (Mostly same, ensure OrbitControls are used)
+        function onWindowResize() { /* ... same ... */
+             const width = window.innerWidth; const height = window.innerHeight;
+             camera.aspect = width / height; camera.updateProjectionMatrix();
+             renderer.setSize(width, height); composer.setSize(width, height);
+        }
+        // --- File/Audio Playback Handlers --- (Remain the same) ---
+        fileInput.addEventListener('change', (event) => { /* ... same ... */
+             const file = event.target.files[0];
+             if (file) {
+                 youtubeLinkInput.value = '';
+                 const reader = new FileReader();
+                 reader.onload = (e) => {
+                     audioPlayer.src = e.target.result; audioPlayer.load();
+                     seekBar.value = 0; playPauseBtn.textContent = 'Play'; isPlaying = false;
+                     if (audioContext && audioContext.state === 'suspended') { audioContext.resume(); }
+                 }
+                 reader.readAsDataURL(file);
+             }
+         });
+         loadYoutubeBtn.addEventListener('click', () => { /* ... same alert ... */
+             alert("Direct YouTube playback is not supported. Please download the audio and use the 'Choose File' button.");
+         });
+         playPauseBtn.addEventListener('click', () => { /* ... same logic ... */
+             if (!audioPlayer.src) { alert("Please upload an audio file first!"); return; }
+             if (!audioContext || audioContext.state === 'suspended') {
+                  setupAudio();
+                  audioContext.resume().then(togglePlayback).catch(e => console.error("AudioContext resume failed:", e));
+              } else { togglePlayback(); }
+         });
+         function togglePlayback() { /* ... same ... */
+             if (isPlaying) { audioPlayer.pause(); playPauseBtn.textContent = 'Play'; }
+             else {
+                  if (!analyser) setupAudio();
+                  audioPlayer.play().then(() => { playPauseBtn.textContent = 'Pause'; })
+                      .catch(e => { console.error("Play Error:", e); playPauseBtn.textContent = 'Play'; isPlaying = false; });
+             }
+             isPlaying = !isPlaying;
+         }
+         audioPlayer.addEventListener('timeupdate', () => { /* ... same ... */
+             if (audioPlayer.duration && isFinite(audioPlayer.duration)) {
+                 seekBar.value = (audioPlayer.currentTime / audioPlayer.duration) * 100;
+                 timeDisplay.textContent = `${formatTime(audioPlayer.currentTime)} / ${formatTime(audioPlayer.duration)}`;
+             } else { timeDisplay.textContent = `${formatTime(audioPlayer.currentTime)} / --:--`; }
+         });
+         audioPlayer.addEventListener('loadedmetadata', () => { /* ... same ... */
+              if (isFinite(audioPlayer.duration)) {
+                  timeDisplay.textContent = `0:00 / ${formatTime(audioPlayer.duration)}`;
+                  seekBar.max = 100; seekBar.value = 0;
+              } else { timeDisplay.textContent = `0:00 / --:--`; seekBar.max = 0; seekBar.value = 0;}
+         });
+         audioPlayer.addEventListener('ended', () => { /* ... same ... */
+             playPauseBtn.textContent = 'Play'; isPlaying = false; seekBar.value = 0; audioPlayer.currentTime = 0;
+         });
+         seekBar.addEventListener('input', () => { /* ... same ... */
+             if (audioPlayer.duration && isFinite(audioPlayer.duration)) {
+                 if (audioPlayer.readyState >= 2 && !audioPlayer.ended) {
+                     audioPlayer.currentTime = (seekBar.value / 100) * audioPlayer.duration;
+                 }
+             }
+         });
+         volumeControl.addEventListener('input', (e) => { audioPlayer.volume = e.target.value; });
+         function formatTime(seconds) { /* ... same ... */
+             if (isNaN(seconds) || !isFinite(seconds)) return "--:--";
+             const minutes = Math.floor(seconds / 60); const secs = Math.floor(seconds % 60);
+             return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
+         }
+        // --- Start Everything ---
+        init();
+
+    </script>
+</body>
+</html>
